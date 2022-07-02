@@ -30,6 +30,7 @@ use risingwave_hummock_sdk::{HummockEpoch, LocalSstableInfo};
 use risingwave_pb::common::worker_node::State::Running;
 use risingwave_pb::common::WorkerType;
 use risingwave_pb::data::Barrier;
+use risingwave_pb::meta::table_fragments::ActorState;
 use risingwave_pb::stream_service::{
     BarrierCompleteRequest, BarrierCompleteResponse, InjectBarrierRequest,
 };
@@ -46,6 +47,7 @@ use self::info::BarrierActorInfo;
 use self::notifier::Notifier;
 use crate::barrier::progress::CreateMviewProgressTracker;
 use crate::barrier::BarrierEpochState::{Complete, InFlight};
+use crate::barrier::ChangedTableState::{Create, Drop};
 use crate::cluster::{ClusterManagerRef, META_NODE_ID};
 use crate::hummock::HummockManagerRef;
 use crate::manager::{CatalogManagerRef, MetaSrvEnv};
@@ -68,6 +70,13 @@ struct ScheduledBarriers {
 
     /// When `buffer` is not empty anymore, all subscribers of this watcher will be notified.
     changed_tx: watch::Sender<()>,
+}
+/// The table state of command
+#[derive(Debug, Clone)]
+pub enum ChangedTableState {
+    Drop(TableId),
+    Create(TableId),
+    NoTable,
 }
 
 impl ScheduledBarriers {
@@ -174,10 +183,40 @@ pub struct GlobalBarrierManager<S: MetaStore> {
 }
 
 struct CheckpointControl<S: MetaStore> {
-    /// Signal whether the barrier with building actor is sent
-    is_build_actor: bool,
     /// Save the state and message of barrier in order
     command_ctx_queue: VecDeque<EpochNode<S>>,
+}
+/// The changed table id vec.
+#[derive(Default)]
+pub struct ChangedTableId {
+    create_table_id: Vec<TableId>,
+    drop_table_id: Vec<TableId>,
+}
+impl ChangedTableId {
+    pub fn can_actor_send_or_collect(&self, s: ActorState, table_id: &TableId) -> bool {
+        s == ActorState::Running && !self.drop_table_id.contains(table_id)
+            || s == ActorState::Inactive && self.create_table_id.contains(table_id)
+    }
+
+    pub fn new<'a, S: MetaStore>(
+        queue_changed_table: impl Iterator<Item = &'a EpochNode<S>>,
+        new_changed_table: ChangedTableState,
+    ) -> Self {
+        let mut create_table_id = vec![];
+        let mut drop_table_id = vec![];
+        queue_changed_table.for_each(|node| match node.command_ctx.command.changed_table_id() {
+            Create(table_id) => create_table_id.push(table_id),
+            Drop(table_id) => drop_table_id.push(table_id),
+            _ => {}
+        });
+        if let Create(table_id) = new_changed_table {
+            create_table_id.push(table_id);
+        };
+        Self {
+            create_table_id,
+            drop_table_id,
+        }
+    }
 }
 
 impl<S> CheckpointControl<S>
@@ -186,9 +225,13 @@ where
 {
     fn new() -> Self {
         Self {
-            is_build_actor: false,
             command_ctx_queue: VecDeque::default(),
         }
+    }
+
+    /// Get all create(drop) actor id from queue.
+    fn get_changed_table_id(&self, new_changed_table: ChangedTableState) -> ChangedTableId {
+        ChangedTableId::new(self.command_ctx_queue.iter(), new_changed_table)
     }
 
     /// Return the nums of barrier (the nums of in-flight-barrier , the nums of all-barrier)
@@ -213,12 +256,9 @@ where
             timer: Some(timer),
             result: None,
             state: InFlight,
-            command_ctx: command_ctx.clone(),
+            command_ctx,
             notifiers,
         });
-        if command_ctx.command.should_pause_inject_barrier() {
-            self.is_build_actor = true;
-        }
     }
 
     /// Change the state of this `prev_epoch` to `Complete`. Return continuous nodes
@@ -239,12 +279,11 @@ where
             node.result = Some(result);
         };
         // Find all continuous nodes with 'Complete' starting from first node
-        let index = match self.command_ctx_queue.iter().find_position(|x| {
-            if x.command_ctx.command.should_pause_inject_barrier() && matches!(x.state, Complete) {
-                self.is_build_actor = false;
-            };
-            !matches!(x.state, Complete)
-        }) {
+        let index = match self
+            .command_ctx_queue
+            .iter()
+            .find_position(|x| !matches!(x.state, Complete))
+        {
             Some((index, _)) => index,
             None => self.command_ctx_queue.len(),
         };
@@ -253,28 +292,21 @@ where
 
     /// Remove all nodes from queue and return them.
     fn fail(&mut self) -> impl Iterator<Item = EpochNode<S>> + '_ {
-        self.command_ctx_queue.iter().for_each(|node| {
-            if !matches!(node.command_ctx.command, Command::Plain(_)) {
-                self.is_build_actor = false;
-            }
-        });
         self.command_ctx_queue.drain(..)
     }
 
     /// Pause inject barrier until True
     fn can_inject_barrier(&self, in_flight_barrier_nums: usize) -> bool {
-        !(self.is_build_actor
-            || self
-                .command_ctx_queue
-                .iter()
-                .filter(|x| matches!(x.state, InFlight))
-                .count()
-                >= in_flight_barrier_nums)
+        self.command_ctx_queue
+            .iter()
+            .filter(|x| matches!(x.state, InFlight))
+            .count()
+            < in_flight_barrier_nums
     }
 }
 
 /// The state and message of this barrier
-struct EpochNode<S: MetaStore> {
+pub struct EpochNode<S: MetaStore> {
     timer: Option<HistogramTimer>,
     result: Option<Result<Vec<BarrierCompleteResponse>>>,
     state: BarrierEpochState,
@@ -411,9 +443,10 @@ where
                 barrier_timer.observe_duration();
             }
             barrier_timer = Some(self.metrics.barrier_send_latency.start_timer());
-
             let (command, notifiers) = self.scheduled_barriers.pop_or_default().await;
-            let info = self.resolve_actor_info(command.creating_table_id()).await;
+            let changed_table_id =
+                checkpoint_control.get_changed_table_id(command.changed_table_id());
+            let info = self.resolve_actor_info(changed_table_id).await;
             // When there's no actors exist in the cluster, we don't need to send the barrier. This
             // is an advance optimization. Besides if another barrier comes immediately,
             // it may send a same epoch and fail the epoch check.
@@ -679,14 +712,14 @@ where
     }
 
     /// Resolve actor information from cluster and fragment manager.
-    async fn resolve_actor_info(&self, creating_table_id: Option<TableId>) -> BarrierActorInfo {
+    async fn resolve_actor_info(&self, changed_table_id: ChangedTableId) -> BarrierActorInfo {
         let all_nodes = self
             .cluster_manager
             .list_worker_node(WorkerType::ComputeNode, Some(Running))
             .await;
         let all_actor_infos = self
             .fragment_manager
-            .load_all_actors(creating_table_id)
+            .load_all_actors(changed_table_id)
             .await;
         BarrierActorInfo::resolve(all_nodes, all_actor_infos)
     }

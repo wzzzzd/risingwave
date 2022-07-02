@@ -691,7 +691,6 @@ where
                     })
                     .collect(),
             })));
-
             log::debug!("pushing down mutation {:#?}", command);
 
             tokio_retry::Retry::spawn(FixedInterval::new(Self::SOURCE_RETRY_INTERVAL), || async {
