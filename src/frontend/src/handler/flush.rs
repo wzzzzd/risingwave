@@ -19,7 +19,8 @@ use crate::session::OptimizerContext;
 
 pub(super) async fn handle_flush(context: OptimizerContext) -> Result<PgResponse> {
     let client = context.session_ctx.env().meta_client();
-    client.flush().await?;
+    let epoch = client.flush().await?;
+    tracing::info!("flush epoch{:?}",epoch);
 
     Ok(PgResponse::empty_result(StatementType::FLUSH))
 }

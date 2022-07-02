@@ -81,7 +81,8 @@ async fn flush_for_write(session: &SessionImpl, stmt_type: StatementType) -> Res
     match stmt_type {
         StatementType::INSERT | StatementType::DELETE | StatementType::UPDATE => {
             let client = session.env().meta_client();
-            client.flush().await?;
+            let epoch = client.flush().await?;
+            tracing::info!("flush for write epoch{:?}",epoch);
         }
         _ => {}
     }

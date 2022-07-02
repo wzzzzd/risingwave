@@ -66,8 +66,8 @@ where
         self.env.idle_manager().record_activity();
         let _req = request.into_inner();
 
-        self.barrier_manager.flush().await?;
-        Ok(Response::new(FlushResponse { status: None }))
+        let epoch = self.barrier_manager.flush().await?;
+        Ok(Response::new(FlushResponse { status: None ,epoch}))
     }
 
     #[cfg_attr(coverage, no_coverage)]

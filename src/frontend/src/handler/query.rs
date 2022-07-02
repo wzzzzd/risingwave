@@ -98,8 +98,8 @@ async fn distribute_execute(
         );
 
         let plan_fragmenter = BatchPlanFragmenter::new(session.env().worker_node_manager_ref());
-        let query = plan_fragmenter.split(plan)?;
-        info!("Generated query after plan fragmenter: {:?}", &query);
+        let query = plan_fragmenter.split(plan.clone())?;
+        info!("{:?},Generated query after plan fragmenter: {:?}",plan.explain_to_string()?, &query);
         (query, pg_descs)
     };
 
@@ -132,12 +132,12 @@ fn local_execute(
 
         info!(
             "Generated local execution plan: {:?}",
-            plan.explain_to_string()?
+            plan.explain_to_string()?.clone()
         );
 
         let plan_fragmenter = BatchPlanFragmenter::new(session.env().worker_node_manager_ref());
-        let query = plan_fragmenter.split(plan)?;
-        info!("Generated query after plan fragmenter: {:?}", &query);
+        let query = plan_fragmenter.split(plan.clone())?;
+        info!("{:?},Generated query after plan fragmenter: {:?}",plan.explain_to_string()?, &query);
         (query, pg_descs)
     };
 

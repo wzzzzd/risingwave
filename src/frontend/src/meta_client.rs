@@ -27,7 +27,7 @@ use risingwave_rpc_client::{HummockMetaClient, MetaClient};
 pub trait FrontendMetaClient: Send + Sync {
     async fn pin_snapshot(&self, last_pinned: u64) -> Result<u64>;
 
-    async fn flush(&self) -> Result<()>;
+    async fn flush(&self) -> Result<u64>;
 
     async fn list_table_fragments(
         &self,
@@ -47,7 +47,7 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
         self.0.pin_snapshot(last_pinned).await
     }
 
-    async fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> Result<u64> {
         self.0.flush().await
     }
 

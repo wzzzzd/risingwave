@@ -22,7 +22,7 @@ pub(super) struct Notifier {
     pub to_send: Option<oneshot::Sender<()>>,
 
     /// Get notified when scheduled barrier is collected or failed.
-    pub collected: Option<oneshot::Sender<Result<()>>>,
+    pub collected: Option<oneshot::Sender<Result<u64>>>,
 
     /// Get notified when scheduled barrier is finished.
     pub finished: Option<oneshot::Sender<()>>,
@@ -37,9 +37,9 @@ impl Notifier {
     }
 
     /// Notify when we have collected a barrier from all actors.
-    pub fn notify_collected(&mut self) {
+    pub fn notify_collected(&mut self,epoch:u64) {
         if let Some(tx) = self.collected.take() {
-            tx.send(Ok(())).ok();
+            tx.send(Ok(epoch)).ok();
         }
     }
 

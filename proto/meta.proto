@@ -67,6 +67,7 @@ message FlushRequest {}
 
 message FlushResponse {
   common.Status status = 1;
+  uint64 epoch = 2;
 }
 
 message ListTableFragmentsRequest {

@@ -326,16 +326,16 @@ where
     }
 
     /// Flush means waiting for the next barrier to collect.
-    pub async fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<u64> {
         let start = Instant::now();
 
         debug!("start barrier flush");
-        self.wait_for_next_barrier_to_collect().await?;
+        let epoch = self.wait_for_next_barrier_to_collect().await?;
 
         let elapsed = Instant::now().duration_since(start);
         debug!("barrier flushed in {:?}", elapsed);
 
-        Ok(())
+        Ok(epoch)
     }
 
     pub async fn start(barrier_manager: BarrierManagerRef<S>) -> (JoinHandle<()>, Sender<()>) {
@@ -420,7 +420,7 @@ where
             if info.nothing_to_do() {
                 let mut notifiers = notifiers;
                 notifiers.iter_mut().for_each(Notifier::notify_to_send);
-                notifiers.iter_mut().for_each(Notifier::notify_collected);
+                notifiers.iter_mut().for_each(|notifier| notifier.notify_collected(0));
                 continue;
             }
             let prev_epoch = state.in_flight_prev_epoch;
@@ -668,7 +668,7 @@ where
 
         // Notify about collected first.
         let mut notifiers = take(&mut node.notifiers);
-        notifiers.iter_mut().for_each(Notifier::notify_collected);
+        notifiers.iter_mut().for_each(|notifier| notifier.notify_collected(node.command_ctx.prev_epoch.0));
         // Then try to finish the barrier for Create MVs.
         let actors_to_finish = node.command_ctx.actors_to_track();
         tracker.add(node.command_ctx.curr_epoch, actors_to_finish, notifiers);
@@ -759,7 +759,7 @@ where
 
     /// Wait for the next barrier to collect. Note that the barrier flowing in our stream graph is
     /// ignored, if exists.
-    pub async fn wait_for_next_barrier_to_collect(&self) -> Result<()> {
+    pub async fn wait_for_next_barrier_to_collect(&self) -> Result<u64> {
         let (tx, rx) = oneshot::channel();
         let notifier = Notifier {
             collected: Some(tx),
