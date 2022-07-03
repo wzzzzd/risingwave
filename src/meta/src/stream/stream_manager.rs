@@ -24,9 +24,7 @@ use risingwave_pb::common::{ActorInfo, ParallelUnitMapping, WorkerNode, WorkerTy
 use risingwave_pb::meta::table_fragments::{ActorState, ActorStatus};
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::{ActorMapping, DispatcherType, StreamNode};
-use risingwave_pb::stream_service::{
-    BroadcastActorInfoTableRequest, BuildActorsRequest, HangingChannel, UpdateActorsRequest,
-};
+use risingwave_pb::stream_service::{BroadcastActorInfoTableRequest, BuildActorsRequest, DropActorsRequest, HangingChannel, UpdateActorsRequest};
 use risingwave_rpc_client::StreamClientPoolRef;
 use uuid::Uuid;
 
@@ -257,24 +255,219 @@ impl<S> GlobalStreamManager<S>
         Ok(())
     }
 
-    pub async fn migrate_actor(&self, actor_map: HashMap<TableId, HashMap<ActorId, WorkerNode>>) -> Result<()> {
-        let table_ids = actor_map.keys().collect();
-        let node_actors = self.fragment_manager.get_tables_node_actors(&table_ids).await?;
+    pub async fn migrate_actor(
+        &self,
+        //actor_map: HashMap<TableId, HashMap<ActorId, WorkerId>>,
+        table_id: TableId,
+        targets: HashMap<ActorId, WorkerId>,
+    ) -> Result<()> {
+        let nodes = self
+            .cluster_manager
+            .list_worker_node(
+                WorkerType::ComputeNode,
+                Some(risingwave_pb::common::worker_node::State::Running),
+            )
+            .await;
 
-        for (table_id, actors) in actor_map {
-            let table_node_actors = node_actors.get(&table_id).unwrap();
+        //let worker_map: HashMap<_, _> = nodes.into_iter().map(|node| (node.id, node)).collect();
 
-            let mut actors_node = HashMap::new();
-            for (worker_id, actor_ids) in table_node_actors {
-                actors_node.extend(actor_ids.into_iter().map(|actor_id| (*actor_id, *worker_id)))
-            }
+        let mut locations = ScheduledLocations::new();
+        locations.node_locations = nodes.into_iter().map(|node| (node.id, node)).collect();
+        // let table_ids = actor_map.keys().cloned().collect();
+        // for (table_id, actors) in actor_map {
+        let table_fragments = self
+            .fragment_manager
+            .select_table_fragments_by_table_id(&table_id)
+            .await?;
+        let table_node_actors = table_fragments.node_actor_ids();
 
-            // for (actor_id, worker_id) in actors {
-            //
-            // }
+        let actor_map = table_fragments.actor_map();
+
+        let mut actors_node = HashMap::new();
+        for (worker_id, actor_ids) in table_node_actors {
+            actors_node.extend(actor_ids.into_iter().map(|actor_id| (actor_id, worker_id)))
         }
 
-        self.barrier_manager.run_command(Command::Plain())
+
+        let mut actors_need_drop = HashMap::new();
+        for actor_id in targets.keys() {
+            //actors_need_drop.insert(actors_node.get(actor_id).unwrap(), actor_id);
+
+            let node_id = actors_node.get(actor_id).unwrap();
+            actors_need_drop.entry(node_id).or_insert(vec![]).push(*actor_id);
+        }
+
+
+        for actor_id in targets.keys() {
+            let actor = actor_map.get(actor_id).unwrap();
+            let _upstreams = actor.upstream_actor_id.clone();
+        }
+
+        let mut node_actors = HashMap::new();
+
+        // todo: check worker_id exists
+        for (actor_id, worker_id) in targets {
+            node_actors.entry(worker_id).or_insert(vec![]).push(actor_id)
+        }
+
+        // for (actor_id, worker_id) in actors {
+        //
+        // }
+
+        // }
+
+
+        // first build actor
+
+        // let mut actor_infos_to_broadcast = locations.actor_infos();
+        // actor_infos_to_broadcast.extend(upstream_node_actors.iter().flat_map(
+        //     |(node_id, upstreams)| {
+        //         upstreams.iter().map(|up_id| ActorInfo {
+        //             actor_id: *up_id,
+        //             host: locations.node_locations.get(node_id).unwrap().host.clone(),
+        //         })
+        //     },
+        // ));
+        //
+        // let actor_host_infos = locations.actor_info_map();
+        //
+        // let node_actors = locations.node_actors();
+        //
+        // let dispatches = dispatches
+        //     .iter()
+        //     .map(|(up_id, down_ids)| {
+        //         (
+        //             *up_id,
+        //             down_ids
+        //                 .iter()
+        //                 .map(|down_id| {
+        //                     actor_host_infos
+        //                         .get(down_id)
+        //                         .expect("downstream actor info not exist")
+        //                         .clone()
+        //                 })
+        //                 .collect_vec(),
+        //         )
+        //     })
+        //     .collect::<HashMap<_, _>>();
+        //
+        // let up_id_to_down_info = dispatches
+        //     .iter()
+        //     .map(|((up_id, _dispatcher_id), down_info)| (*up_id, down_info.clone()))
+        //     .collect::<HashMap<_, _>>();
+        //
+        // let mut node_hanging_channels = upstream_node_actors
+        //     .iter()
+        //     .map(|(node_id, up_ids)| {
+        //         (
+        //             *node_id,
+        //             up_ids
+        //                 .iter()
+        //                 .flat_map(|up_id| {
+        //                     up_id_to_down_info
+        //                         .get(up_id)
+        //                         .expect("expected dispatches info")
+        //                         .iter()
+        //                         .map(|down_info| HangingChannel {
+        //                             upstream: Some(ActorInfo {
+        //                                 actor_id: *up_id,
+        //                                 host: None,
+        //                             }),
+        //                             downstream: Some(down_info.clone()),
+        //                         })
+        //                 })
+        //                 .collect_vec(),
+        //         )
+        //     })
+        //     .collect::<HashMap<_, _>>();
+        //
+        // We send RPC request in two stages.
+        // The first stage does 2 things: broadcast actor info, and send local actor ids to
+        // different WorkerNodes. Such that each WorkerNode knows the overall actor
+        // allocation, but not actually builds it. We initialize all channels in this stage.
+        for (node_id, actors) in &node_actors {
+            let node = locations.node_locations.get(node_id).unwrap();
+
+            let client = self.client_pool.get(node).await?;
+            //
+            // client
+            //     .to_owned()
+            //     .broadcast_actor_info_table(BroadcastActorInfoTableRequest {
+            //         info: actor_infos_to_broadcast.clone(),
+            //     })
+            //     .await?;
+
+            let stream_actors = actors
+                .iter()
+                .map(|actor_id| actor_map.get(actor_id).cloned().unwrap())
+                .collect::<Vec<_>>();
+
+            let request_id = Uuid::new_v4().to_string();
+            tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "update actors");
+            client
+                .to_owned()
+                .update_actors(UpdateActorsRequest {
+                    request_id,
+                    actors: stream_actors.clone(),
+                    hanging_channels: vec![], //node_hanging_channels.remove(node_id).unwrap_or_default(),
+                })
+                .await?;
+        }
+
+        // for (node_id, hanging_channels) in node_hanging_channels {
+        //     let node = locations.node_locations.get(&node_id).unwrap();
+        //
+        //     let client = self.client_pool.get(node).await?;
+        //     let request_id = Uuid::new_v4().to_string();
+        //
+        //     client
+        //         .to_owned()
+        //         .update_actors(UpdateActorsRequest {
+        //             request_id,
+        //             actors: vec![],
+        //             hanging_channels,
+        //         })
+        //         .await?;
+        // }
+        //
+        // In the second stage, each [`WorkerNode`] builds local actors and connect them with
+        // channels.
+        for (node_id, actors) in node_actors {
+            let node = locations.node_locations.get(&node_id).unwrap();
+
+            let client = self.client_pool.get(node).await?;
+
+            let request_id = Uuid::new_v4().to_string();
+            tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "build actors");
+            client
+                .to_owned()
+                .build_actors(BuildActorsRequest {
+                    request_id,
+                    actor_id: actors,
+                })
+                .await?;
+        }
+
+        //
+
+        // drop old actors
+
+        for (node_id, actors) in actors_need_drop {
+            let node = locations.node_locations.get(&node_id).unwrap();
+
+            let client = self.client_pool.get(node).await?;
+
+            let request_id = Uuid::new_v4().to_string();
+            tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "build actors");
+            client
+                .to_owned()
+                .drop_actors(DropActorsRequest {
+                    request_id,
+                    actor_ids: actors.to_owned(),
+                })
+                .await?;
+        }
+
 
         todo!()
     }
