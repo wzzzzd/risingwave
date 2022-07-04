@@ -798,7 +798,7 @@ fn parse_in_subquery() {
 }
 
 #[test]
-fn parse_string_agg() {
+fn parse_string_concat() {
     let sql = "SELECT a || b";
 
     let select = verified_only_select(sql);
